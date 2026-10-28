@@ -1,4 +1,5 @@
-
+import logging
+import httpx
 import hashlib
 import hmac
 import re
@@ -231,29 +232,25 @@ def verify_whatsapp_webhook(
     )
 
 
+
+
 @app.post("/webhook/whatsapp", tags=["WhatsApp"])
 async def receive_whatsapp_webhook(request: Request):
-    """
-    Receive WhatsApp webhook events.
+    """Verify Meta's signature and reply to incoming WhatsApp text messages."""
 
-    Message processing remains disabled until Meta signature
-    verification and safe message handling are implemented.
-    """
     app_secret = settings.meta_app_secret
+    access_token = settings.whatsapp_access_token
+    phone_number_id = settings.whatsapp_phone_number_id
+    api_version = settings.meta_graph_api_version
 
-    if not app_secret:
+    if not all([app_secret, access_token, phone_number_id, api_version]):
         raise HTTPException(
             status_code=503,
-            detail=(
-                "WhatsApp webhook processing is not configured."
-            ),
+            detail="WhatsApp integration is not fully configured.",
         )
 
-    signature = request.headers.get(
-        "X-Hub-Signature-256",
-        "",
-    )
-
+    # Verify Meta's request signature before trusting the payload.
+    signature = request.headers.get("X-Hub-Signature-256", "")
     if not signature.startswith("sha256="):
         raise HTTPException(
             status_code=401,
@@ -270,21 +267,109 @@ async def receive_whatsapp_webhook(request: Request):
 
     received_signature = signature.removeprefix("sha256=")
 
-    if not hmac.compare_digest(
-        received_signature,
-        expected_signature,
-    ):
+    if not hmac.compare_digest(received_signature, expected_signature):
         raise HTTPException(
             status_code=401,
             detail="Webhook signature verification failed.",
         )
 
-    # Signature verification is implemented, but inbound message
-    # processing and replies have not yet been connected.
-    raise HTTPException(
-        status_code=501,
-        detail=(
-            "Webhook signature verified, but WhatsApp message "
-            "processing has not been implemented yet."
-        ),
-    )
+    try:
+        payload = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+
+    # Meta also sends delivery-status notifications, which we don't answer.
+    try:
+        value = payload["entry"][0]["changes"][0]["value"]
+        messages = value.get("messages", [])
+    except (KeyError, IndexError, TypeError):
+        return {"status": "received", "message": "No incoming messages."}
+
+    if not messages:
+        return {"status": "received", "message": "No incoming messages."}
+
+    results = []
+
+    for message in messages:
+        # This first version handles text messages only.
+        if message.get("type") != "text":
+            continue
+
+        sender = message.get("from")
+        text = message.get("text", {}).get("body", "").strip()
+
+        if not sender or not text:
+            continue
+
+        try:
+            # Use the existing pricing service for price-related questions.
+            lower_text = text.lower()
+            price_keywords = (
+                "price", "how much", "cost", "naira", "₦", "sku"
+            )
+
+            if any(keyword in lower_text for keyword in price_keywords):
+                answer_result = answer_price_question(text)
+            else:
+                answer_result = answer_question(text)
+
+            # Support either a plain string or a dictionary result.
+            if isinstance(answer_result, dict):
+                reply = answer_result.get("answer", "")
+            else:
+                reply = str(answer_result)
+
+            if not reply:
+                reply = (
+                    "Sorry, I couldn't prepare an answer just now. "
+                    "Please try again shortly."
+                )
+
+            # WhatsApp text messages have a 4,096-character body limit.
+            reply = reply[:4000]
+
+            url = (
+                f"https://graph.facebook.com/"
+                f"{api_version}/{phone_number_id}/messages"
+            )
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            }
+
+            outgoing_message = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": sender,
+                "type": "text",
+                "text": {
+                    "preview_url": False,
+                    "body": reply,
+                },
+            }
+
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    json=outgoing_message,
+                )
+
+            if response.is_success:
+                results.append({"status": "sent"})
+            else:
+                # Avoid logging tokens or the customer's message.
+                print(
+                    "WhatsApp send failed:",
+                    response.status_code,
+                    response.text[:500],
+                )
+                results.append({"status": "send_failed"})
+
+        except Exception as exc:
+            # Keep diagnostics limited; never log secrets or message contents.
+            print("WhatsApp message processing failed:", type(exc).__name__)
+            results.append({"status": "processing_failed"})
+
+    return {"status": "processed", "results": results}
